@@ -213,191 +213,26 @@ class BasePredictor:
 
     @smart_inference_mode()
     def stream_inference(self, source=None, model=None, *args, **kwargs):
-        """Streams real-time inference on camera feed and saves results to file."""
-        if self.args.verbose:
-            LOGGER.info("")
+        """Streams real-time inference on camera feed and processes results."""
+        self.setup_source(source)
+        model = model or self.model
+        assert model is not None, "Model must be specified or initialized."
 
-        # Setup model
-        if not self.model:
-            self.setup_model(model)
+        for img, orig_img in self.dataset:  # Load image and original image
+            self.seen += 1
+            preds = self.inference(img, *args, **kwargs)  # Get predictions
+            results = self.postprocess(preds, img, orig_img)  # Process results
+            self.write_results(self.seen - 1, img, orig_img, results)  # Save results
 
-        with self._lock:  # for thread-safe inference
-            # Setup source every time predict is called
-            self.setup_source(source if source is not None else self.args.source)
+    def write_results(self, i, path, im, results):
+        """Write results to a text file instead of saving images with bounding boxes."""
+        text_file_path = self.save_dir / "results.txt"  # specify your output file name
 
-            # Check if save_dir/ label file exists
-            if self.args.save or self.args.save_txt:
-                (self.save_dir / "labels" if self.args.save_txt else self.save_dir).mkdir(parents=True, exist_ok=True)
-
-            # Warmup model
-            if not self.done_warmup:
-                self.model.warmup(imgsz=(1 if self.model.pt or self.model.triton else self.dataset.bs, 3, *self.imgsz))
-                self.done_warmup = True
-
-            self.seen, self.windows, self.batch = 0, [], None
-            profilers = (
-                ops.Profile(device=self.device),
-                ops.Profile(device=self.device),
-                ops.Profile(device=self.device),
-            )
-            self.run_callbacks("on_predict_start")
-            for self.batch in self.dataset:
-                self.run_callbacks("on_predict_batch_start")
-                paths, im0s, s = self.batch
-
-                # Preprocess
-                with profilers[0]:
-                    im = self.preprocess(im0s)
-
-                # Inference
-                with profilers[1]:
-                    preds = self.inference(im, *args, **kwargs)
-                    if self.args.embed:
-                        yield from [preds] if isinstance(preds, torch.Tensor) else preds  # yield embedding tensors
-                        continue
-
-                # Postprocess
-                with profilers[2]:
-                    self.results = self.postprocess(preds, im, im0s)
-                self.run_callbacks("on_predict_postprocess_end")
-
-                # Visualize, save, write results
-                n = len(im0s)
-                for i in range(n):
-                    self.seen += 1
-                    self.results[i].speed = {
-                        "preprocess": profilers[0].dt * 1e3 / n,
-                        "inference": profilers[1].dt * 1e3 / n,
-                        "postprocess": profilers[2].dt * 1e3 / n,
-                    }
-                    if self.args.verbose or self.args.save or self.args.save_txt or self.args.show:
-                        s[i] += self.write_results(i, Path(paths[i]), im, s)
-
-                # Print batch results
-                if self.args.verbose:
-                    LOGGER.info("\n".join(s))
-
-                self.run_callbacks("on_predict_batch_end")
-                yield from self.results
-
-        # Release assets
-        for v in self.vid_writer.values():
-            if isinstance(v, cv2.VideoWriter):
-                v.release()
-
-        # Print final results
-        if self.args.verbose and self.seen:
-            t = tuple(x.t / self.seen * 1e3 for x in profilers)  # speeds per image
-            LOGGER.info(
-                f"Speed: %.1fms preprocess, %.1fms inference, %.1fms postprocess per image at shape "
-                f"{(min(self.args.batch, self.seen), 3, *im.shape[2:])}" % t
-            )
-        if self.args.save or self.args.save_txt or self.args.save_crop:
-            nl = len(list(self.save_dir.glob("labels/*.txt")))  # number of labels
-            s = f"\n{nl} label{'s' * (nl > 1)} saved to {self.save_dir / 'labels'}" if self.args.save_txt else ""
-            LOGGER.info(f"Results saved to {colorstr('bold', self.save_dir)}{s}")
-        self.run_callbacks("on_predict_end")
-
-    def setup_model(self, model, verbose=True):
-        """Initialize YOLO model with given parameters and set it to evaluation mode."""
-        self.model = AutoBackend(
-            weights=model or self.args.model,
-            device=select_device(self.args.device, verbose=verbose),
-            dnn=self.args.dnn,
-            data=self.args.data,
-            fp16=self.args.half,
-            batch=self.args.batch,
-            fuse=True,
-            verbose=verbose,
-        )
-
-        self.device = self.model.device  # update device
-        self.args.half = self.model.fp16  # update half
-        self.model.eval()
-
-    def write_results(self, i, p, im, s):
-        """Write inference results to a file or directory."""
-        string = ""  # print string
-        if len(im.shape) == 3:
-            im = im[None]  # expand for batch dim
-        if self.source_type.stream or self.source_type.from_img or self.source_type.tensor:  # batch_size >= 1
-            string += f"{i}: "
-            frame = self.dataset.count
-        else:
-            match = re.search(r"frame (\d+)/", s[i])
-            frame = int(match[1]) if match else None  # 0 if frame undetermined
-
-        self.txt_path = self.save_dir / "labels" / (p.stem + ("" if self.dataset.mode == "image" else f"_{frame}"))
-        string += "{:g}x{:g} ".format(*im.shape[2:])
-        result = self.results[i]
-        result.save_dir = self.save_dir.__str__()  # used in other locations
-        string += f"{result.verbose()}{result.speed['inference']:.1f}ms"
-
-        # Add predictions to image
-        if self.args.save or self.args.show:
-            self.plotted_img = result.plot(
-                line_width=self.args.line_width,
-                boxes=self.args.show_boxes,
-                conf=self.args.show_conf,
-                labels=self.args.show_labels,
-                im_gpu=None if self.args.retina_masks else im[i],
-            )
-
-        # Save results
-        if self.args.save_txt:
-            result.save_txt(f"{self.txt_path}.txt", save_conf=self.args.save_conf)
-        if self.args.save_crop:
-            result.save_crop(save_dir=self.save_dir / "crops", file_name=self.txt_path.stem)
-        if self.args.show:
-            self.show(str(p))
-        if self.args.save:
-            self.save_predicted_images(str(self.save_dir / p.name), frame)
-
-        return string
-
-    def save_predicted_images(self, save_path="", frame=0):
-        """Save video predictions as mp4 at specified path."""
-        im = self.plotted_img
-
-        # Save videos and streams
-        if self.dataset.mode in {"stream", "video"}:
-            fps = self.dataset.fps if self.dataset.mode == "video" else 30
-            frames_path = f'{save_path.split(".", 1)[0]}_frames/'
-            if save_path not in self.vid_writer:  # new video
-                if self.args.save_frames:
-                    Path(frames_path).mkdir(parents=True, exist_ok=True)
-                suffix, fourcc = (".mp4", "avc1") if MACOS else (".avi", "WMV2") if WINDOWS else (".avi", "MJPG")
-                self.vid_writer[save_path] = cv2.VideoWriter(
-                    filename=str(Path(save_path).with_suffix(suffix)),
-                    fourcc=cv2.VideoWriter_fourcc(*fourcc),
-                    fps=fps,  # integer required, floats produce error in MP4 codec
-                    frameSize=(im.shape[1], im.shape[0]),  # (width, height)
-                )
-
-            # Save video
-            self.vid_writer[save_path].write(im)
-            if self.args.save_frames:
-                cv2.imwrite(f"{frames_path}{frame}.jpg", im)
-
-        # Save images
-        else:
-            cv2.imwrite(str(Path(save_path).with_suffix(".jpg")), im)  # save to JPG for best support
-
-    def show(self, p=""):
-        """Display an image in a window using the OpenCV imshow function."""
-        im = self.plotted_img
-        if platform.system() == "Linux" and p not in self.windows:
-            self.windows.append(p)
-            cv2.namedWindow(p, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)  # allow window resize (Linux)
-            cv2.resizeWindow(p, im.shape[1], im.shape[0])  # (width, height)
-        cv2.imshow(p, im)
-        cv2.waitKey(300 if self.dataset.mode == "image" else 1)  # 1 millisecond
-
-    def run_callbacks(self, event: str):
-        """Runs all registered callbacks for a specific event."""
-        for callback in self.callbacks.get(event, []):
-            callback(self)
-
-    def add_callback(self, event: str, func):
-        """Add callback."""
-        self.callbacks[event].append(func)
+        with open(text_file_path, "a") as f:  # append mode
+            for result in results:
+                f.write(f"{result['class']} {result['confidence']} "
+                         f"{result['x_min']} {result['y_min']} "
+                         f"{result['x_max']} {result['y_max']}\n")
+        
+        # Optionally log or print the path to results
+        LOGGER.info(f"Results written to {text_file_path}")
